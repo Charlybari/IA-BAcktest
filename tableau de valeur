@@ -1,0 +1,1437 @@
+import pandas as pd
+import pandas_ta as pda
+import requests
+import datetime
+import random
+import talib
+import numpy as np
+import ta
+# -- You can change variables below --
+makerFee = 0.0002
+takerFee = 0.0007
+
+# -- Do not touch these values --
+initialWallet = lastAth = 100  # Initialize to 100. This value will be changed later.
+previousRow = None  # We'll assign this later when we have the dfTest
+stopLoss = 0
+takeProfit = 500000
+orderInProgress = ''
+longIniPrice = 0
+shortIniPrice = 0
+longLiquidationPrice = 500000
+shortLiquidationPrice = 0 
+
+def get_historical_klines(symbol, interval, start_date, limit):
+    # Convertir la date de début en timestamp UNIX en millisecondes
+    start_timestamp = int(datetime.datetime.strptime(start_date, "%d %B %Y").timestamp()) * 1000
+
+    # Construire l'URL de l'API avec la date de début spécifiée
+    url = f"https://api.binance.com/api/v1/klines?symbol={symbol}&interval={interval}&startTime={start_timestamp}&limit={limit}"
+    
+    # Récupérer les données depuis l'API
+    data = requests.get(url).json()
+    
+    # Créer un DataFrame à partir des données
+    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'])
+    
+    # Convertir les colonnes de prix en types numériques
+    df['close'] = pd.to_numeric(df['close'])
+    df['high'] = pd.to_numeric(df['high'])
+    df['low'] = pd.to_numeric(df['low'])
+    df['open'] = pd.to_numeric(df['open'])
+    
+    # Définir l'index du DataFrame sur la colonne 'timestamp'
+    df.index = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # Supprimer la colonne 'timestamp' (si vous ne voulez pas la conserver)
+    del df['timestamp']
+    
+    return df
+
+# -- Get all trading pairs --
+def get_all_trading_pairs():
+    url = "https://api.binance.com/api/v1/exchangeInfo"
+    data = requests.get(url).json()
+    symbols = [pair['symbol'] for pair in data['symbols'] if 'USDT' in pair['symbol']]
+    return symbols
+
+# -- Choose a random symbol, interval, and start date --
+def choose_parameters():
+    symbols = get_all_trading_pairs()
+    intervals = ["1d", "12h", "4h", "2h", "1h", "30m", "15m", "5m", "3m", "1m"]
+    symbol = random.choice(symbols)
+    interval = random.choice(intervals)
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=random.randint(1,180))).strftime("%d %B %Y")
+    
+    # Choose a random leverage and wallet amount
+    leverages = [5, 10]
+    wallets = [100, 200, 400, 600, 800, 1000]
+    leverage = random.choice(leverages)
+    wallet = random.choice(wallets)
+
+    global initialWallet, lastAth
+    initialWallet = wallet  # Set the initialWallet to the randomly chosen wallet amount
+    lastAth = wallet
+
+    return symbol, interval, start_date, leverage, wallet
+
+# Choose parameters
+symbol, interval, start_date, leverage, wallet = choose_parameters()
+
+# -- Load all price data from binance API --
+df = get_historical_klines(symbol, interval, start_date, 100)
+
+
+
+# Print outputs
+print("Symbol:", symbol)
+print("Interval:", interval)
+print("Start Date", start_date)
+print("Leverage:", leverage)
+print("Wallet:", wallet)
+print("Choice loaded 100%")
+
+
+def get_chop(high, low, close, window):
+    tr1 = pd.DataFrame(high - low).rename(columns = {0:'tr1'})
+    tr2 = pd.DataFrame(abs(high - close.shift(1))).rename(columns = {0:'tr2'})
+    tr3 = pd.DataFrame(abs(low - close.shift(1))).rename(columns = {0:'tr3'})
+    frames = [tr1, tr2, tr3]
+    tr = pd.concat(frames, axis = 1, join = 'inner').dropna().max(axis = 1)
+    atr = tr.rolling(1).mean()
+    highh = high.rolling(window).max()
+    lowl = low.rolling(window).min()
+    ci = 100 * np.log10((atr.rolling(window).sum()) / (highh - lowl)) / np.log10(window)
+    return ci
+
+def chopiness_to_percentage(chopiness):
+    """
+    Convertit un chopiness en pourcentage selon les conditions suivantes :
+    chopiness = 70 : 0%
+    chopiness = 30 : 100%
+    """
+    if chopiness >= 70:
+        return 0
+    elif chopiness <= 30:
+        return 100
+    else:
+        return (70 - chopiness) * 100 / 40
+def signal_4(df):
+    chop_diff = df['CHOP100'].diff(periods=1)
+    signal = [1 if chop_diff[i]>0 and chop_diff[i-1]>0 else -1 if chop_diff[i]<0 and chop_diff[i-1]<0 else 0 for i in range(1, len(chop_diff))]
+    signal.insert(0,0)
+    return signal
+def chop_diff(df):
+    return df['CHOP100'].diff(periods=1)
+
+def rsi_diff(df):
+    return df['STOCH_RSI'].diff(periods=1)*100
+# Paramètres des indicateurs
+CHOPINESS_LENGTH = 14
+SUPERTREND_ATR_PERIOD = 10
+SUPERTREND_FACTOR = 2.0
+EMA_WINDOW1 = 2
+EMA_WINDOW2 = 3
+RSI_PERIOD = 14
+WILLIAMS_R_PERIOD = 14
+MACD_FAST_LENGTH = 12
+MACD_SLOW_LENGTH = 26
+MACD_SIGNAL_LENGTH = 9
+BOLLINGER_PERIOD = 20
+BOLLINGER_NBDEVUP = 2
+BOLLINGER_NBDEVDN = 2
+STOCHASTIC_FASTK_PERIOD = 14
+STOCHASTIC_SLOWK_PERIOD = 3
+STOCHASTIC_SLOWD_PERIOD = 3
+SAR_START = 0.02
+SAR_MAXP = 0.2
+ATR_PERCENT_DIFF_PERIOD = 14
+CMF_PERIOD = 20
+
+# --- SECTION 2: Fonctions des indicateurs ---
+def price_percent_diff(df):
+    """Calcule la différence en % entre le prix de clôture actuel et le précédent."""
+    close_values = df['close'].values
+    price_percent_diff = [0]  # Premier élément n'a pas de valeur précédente, donc 0%
+
+    for i in range(1, len(close_values)):
+        percent_change = ((close_values[i] - close_values[i-1]) / close_values[i-1]) * 100
+        price_percent_diff.append(percent_change)
+    
+    return price_percent_diff
+
+def get_chopiness(df, length=CHOPINESS_LENGTH):
+    """
+    Calculer l'indice de choppiness.
+    """
+    atr_val = talib.ATR(df['high'], df['low'], df['close'], timeperiod=length)
+    sum_atr = atr_val.rolling(window=length).sum()
+    highest = df['high'].rolling(window=length).max()
+    lowest = df['low'].rolling(window=length).min()
+    ci = 100 * np.log10(sum_atr / (highest - lowest)) / np.log10(length)
+    return ci
+def get_supertrend(df, atr_period=SUPERTREND_ATR_PERIOD, factor=SUPERTREND_FACTOR):
+    """
+    Calculate Supertrend.
+    """
+    # Compute basic upper and lower bands
+    hl2 = (df['high'] + df['low']) / 2
+    atr = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=atr_period)
+    upper_band_basic = hl2 + (factor * atr)
+    lower_band_basic = hl2 - (factor * atr)
+    
+    # Initialize columns for upper_band and lower_band
+    df['upper_band'] = np.nan
+    df['lower_band'] = np.nan
+
+    df.loc[0, 'upper_band'] = upper_band_basic.iloc[0]
+    df.loc[0, 'lower_band'] = lower_band_basic.iloc[0]
+
+    for i in range(2, len(df)):
+        df.loc[i, 'upper_band'] = upper_band_basic.iloc[i] if (upper_band_basic.iloc[i] < df.loc[i-1, 'close']) or (df.loc[i-1, 'close'] < df.loc[i-2, 'close']) else df.loc[i-1, 'upper_band']
+        df.loc[i, 'lower_band'] = lower_band_basic.iloc[i] if (lower_band_basic.iloc[i] > df.loc[i-1, 'close']) or (df.loc[i-1, 'close'] > df.loc[i-2, 'close']) else df.loc[i-1, 'lower_band']
+
+
+    # Determine Supertrend
+    df['ST'] = np.where(df['close'] > df['upper_band'], 1, np.where(df['close'] < df['lower_band'], -1, np.nan))
+    df['ST'] = df['ST'].astype('Int64')
+    df['ST'].fillna(method='ffill', inplace=True)
+
+    # Clean up the additional columns if you don't need them
+    df.drop(['upper_band', 'lower_band'], axis=1, inplace=True)
+    
+    return df['ST'] 
+
+def get_ema(df, window1=EMA_WINDOW1, window2=EMA_WINDOW2):
+    """
+    Calculer la Moyenne Mobile Exponentielle (EMA).
+    """
+    ema1 = df['Close'].ewm(span=window1, adjust=False).mean()
+    ema2 = df['Close'].ewm(span=window2, adjust=False).mean()
+    return ema1, ema2
+
+def get_rsi(df, period=RSI_PERIOD):
+    """
+    Calculer l'indice de force relative (RSI).
+    """
+    return talib.RSI(df['close'].values, timeperiod=period)
+
+def rsi_percent(df):
+    """Calcule la différence en % entre la valeur actuelle et la précédente."""
+    rsi_values = df['rsi'].values  # Notez le 'rsi' en minuscules
+    rsi_percent_diff = [0]  # Premier élément n'a pas de valeur précédente, donc 0%
+
+    for i in range(1, len(rsi_values)):
+        percent_change = ((rsi_values[i] - rsi_values[i-1]) / rsi_values[i-1]) * 100
+        rsi_percent_diff.append(percent_change)
+    
+    return rsi_percent_diff
+
+def get_williams_r(df, period=WILLIAMS_R_PERIOD):
+    """
+    Calculer le Williams %R.
+    """
+    return talib.WILLR(df['high'].values, df['low'].values, df['close'].values, timeperiod=period)
+
+def get_macd(df, fast_length=MACD_FAST_LENGTH, slow_length=MACD_SLOW_LENGTH, signal_length=MACD_SIGNAL_LENGTH):
+    """
+    Calculer le MACD (Moving Average Convergence Divergence).
+    """
+    macd, signal, _ = talib.MACD(df['close'].values, fastperiod=fast_length, slowperiod=slow_length, signalperiod=signal_length)
+    return macd, signal
+
+def get_bollinger_bands(df, period=BOLLINGER_PERIOD, nbdevup=BOLLINGER_NBDEVUP, nbdevdn=BOLLINGER_NBDEVDN):
+    """
+    Calculer les Bollinger Bands.
+    """    
+    upper, middle, lower = talib.BBANDS(df['close'], timeperiod=period, nbdevup=nbdevup, nbdevdn=nbdevdn)
+    return upper, middle, lower
+
+def get_stochastic_oscillator(df, fastk_period=STOCHASTIC_FASTK_PERIOD, slowk_period=STOCHASTIC_SLOWK_PERIOD, slowd_period=STOCHASTIC_SLOWD_PERIOD):
+    """
+    Calculer le Stochastic Oscillator.
+    """
+    slowk, slowd = talib.STOCH(df['high'], df['low'], df['close'], fastk_period=fastk_period, slowk_period=slowk_period, slowd_period=slowd_period, slowk_matype=0, slowd_matype=0)
+    return slowk, slowd
+
+def get_sar_direction(df, start=SAR_START, maxp=SAR_MAXP):
+    try:
+        sar = talib.SAR(df['high'], df['low'], acceleration=start, maximum=maxp)
+        return np.where(df['close'] > sar, 1, -1)  # 1 si au-dessus, -1 si en dessous
+    except Exception as e:
+        print(f"Erreur: {e}")
+        print(f"High: {df['high'].head()}, Low: {df['low'].head()}")
+        return None
+
+
+def get_cmf(df, period=CMF_PERIOD):
+    """
+    Calculer le Money Flow Chaikin (CMF).
+    """
+    clv = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'])
+    cmf = (clv * df['volume']).rolling(window=period).sum() / df['volume'].rolling(window=period).sum()
+    return cmf
+
+def get_cmf_percent_diff(df, period=CMF_PERIOD):
+    cmf = get_cmf(df, period)
+    cmf_prev = cmf.shift(1)
+    cmf_percent_diff = ((cmf - cmf_prev) / cmf_prev) * 100
+    return cmf_percent_diff
+# [Vous pouvez ajouter des fonctions pour d'autres indicateurs selon vos besoins]
+
+def get_fibonacci_retracement(df):
+    max_price = df['high'].max()
+    min_price = df['low'].min()
+    
+    diff = max_price - min_price
+
+    retracement_levels = {
+        '0.0%': max_price,
+        '23.6%': max_price - 0.236 * diff,
+        '38.2%': max_price - 0.382 * diff,
+        '50.0%': max_price - 0.5 * diff,
+        '61.8%': max_price - 0.618 * diff,
+        '100.0%': min_price
+    }
+    return retracement_levels
+
+def get_atr_percent_diff(df, period=ATR_PERCENT_DIFF_PERIOD):
+    atr_series = pd.Series(talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=period))
+    atr_prev = atr_series.shift(1)
+    atr_percent_diff = (atr_series - atr_prev) / atr_prev * 100
+    return atr_percent_diff
+
+
+def get_ema_diff(df, window1=EMA_WINDOW1, window2=EMA_WINDOW2):
+    ema1 = talib.EMA(df['close'], timeperiod=window1)
+    ema2 = talib.EMA(df['close'], timeperiod=window2)
+    return np.where(ema1 > ema2, 1, -1)  # La colonne sera remplie par 1 si ema1 est supérieur à ema2, sinon par -1
+
+def ICPA(df):
+    df['power'] = np.where(df['close'] > df['open'], (df['close'] - df['open']) * df['volume'], (df['open'] - df['close']) * df['volume'])
+    df['cumulative_power'] = df['power'].rolling(window=10).sum()
+
+    rsi_series = get_rsi(df)
+    macd_series, macd_signal_series = get_macd(df) # get_macd retourne deux séries : MACD et le signal MACD
+    df['trend'] = np.where(df['close'].rolling(window=30).mean() > df['close'], -1, 1)  # Simplified trend calculation
+
+    df['signal'] = np.where(
+        (df['cumulative_power'] > 0) & (rsi_series > 70) & (macd_series > 0) & (df['trend'] == 1), 
+        -1, 
+        np.where((df['cumulative_power'] < 0) & (rsi_series < 30) & (macd_series < 0) & (df['trend'] == -1), 
+                 1, 
+                 0
+                )
+    )
+
+    return df['signal']
+
+# Calculez si la bougie est positive ou négative
+def bougie(curr_close, prev_close):
+    return 1 if curr_close > prev_close else -1 if curr_close < prev_close else 0
+
+# Calculez la divergence pour une période
+def single_period_divergence(row):
+    if row['RSI%'] > 0 and row['Bougie'] < 0:
+        return -1
+    elif row['RSI%'] < 0 and row['Bougie'] > 0:
+        return 1
+    else:
+        return 0
+# Calculez la divergence finale
+def final_divergence(curr_row, prev_row):
+    if curr_row['TempDivergence'] == -1:
+        return -1
+    elif curr_row['TempDivergence'] == 1:
+        return 1
+    else:
+        return 0
+
+def compute_FactRSICHANG_percent(df):
+    """
+    Calcule la différence en pourcentage entre la valeur réelle et sa période précédente pour 
+    l'expression (Change%/RSI%)*100.
+
+    Args:
+    - df (pd.DataFrame): DataFrame contenant les colonnes 'Change%' et 'RSI%'.
+
+    Returns:
+    - pd.Series: une série contenant les changements en pourcentage.
+    """
+    
+    # Calculer l'expression pour la période actuelle
+    current_value = (df['Change%'] / df['RSI%']) * 100
+    
+    # Calculer l'expression pour la période précédente
+    previous_value = ((df['Change%'].shift(1)) / df['RSI%'].shift(1)) * 100
+    
+    # Calculer la différence en pourcentage
+    percent_change = ((current_value - previous_value) / previous_value) * 100
+
+    # Remplace les NaN par 0 (comme pour la première ligne où il n'y a pas de période précédente)
+    return percent_change.fillna(0)
+
+def awesome_oscillator(df):
+    # Calculate mid-point (hl2) of each bar
+    df['hl2'] = (df['high'] + df['low']) / 2
+    # Compute the 5-period and 34-period SMA of the mid-point
+    df['sma5'] = df['hl2'].rolling(window=5).mean()
+    df['sma34'] = df['hl2'].rolling(window=34).mean()
+    # Calculate AO
+    df['ao'] = df['sma5'] - df['sma34']
+    # Get the difference between current and previous AO
+    df['diff'] = df['ao'].diff()
+    # Map the differences to -1, 0, or 1 and return this series
+    return np.where(df['diff'] > 0, 1, np.where(df['diff'] < 0, -1, 0))
+
+def bull_bear_power(df, length=13):
+    # Compute the Exponential Moving Average (EMA) of the close
+    df['ema_close'] = df['close'].ewm(span=length, adjust=False).mean()
+    
+    # Calculate Bull and Bear Power
+    df['bullPower'] = df['high'] - df['ema_close']
+    df['bearPower'] = df['low'] - df['ema_close']
+    
+    # Calculate BBPower as the sum of Bull and Bear Power
+    df['BBPower'] = df['bullPower'] + df['bearPower']
+    
+    # Compute the percentage difference between the current BBPower and the previous BBPower
+    df['BBPower_diff_percent'] = df['BBPower'].pct_change() * 100
+    
+    return df['BBPower_diff_percent']
+
+def simple_ultimate_oscillator(df, lenFast=7, lenMid=14, lenSlow=28):
+    # Calculate bp and tr values
+    df['max'] = df[['high', 'close']].shift(1).max(axis=1)
+    df['min'] = df[['low', 'close']].shift(1).min(axis=1)
+    df['bp'] = df['close'] - df['min']
+    df['tr'] = df['max'] - df['min']
+    
+    # Custom function to compute part of UO
+    def createUoVar(df, length):
+        return df['bp'].rolling(window=length).sum() / df['tr'].rolling(window=length).sum()
+    
+    # Calculate the components of the UO
+    uoFast = createUoVar(df, lenFast)
+    uoMid = createUoVar(df, lenMid)
+    uoSlow = createUoVar(df, lenSlow)
+    
+    # Calculate the UO and its percent difference
+    df['uo'] = 100 * (4 * uoFast + 2 * uoMid + uoSlow) / 7
+    df['uo_diff_percent'] = df['uo'].pct_change() * 100
+    
+    return df['uo_diff_percent']
+    
+def compute_cci(df, period=20):
+    TP = (df['high'] + df['low'] + df['close']) / 3
+    rolling_mean = TP.rolling(window=period).mean()
+    rolling_std = TP.rolling(window=period).std()
+    cci = (TP - rolling_mean) / (0.015 * rolling_std)
+    return cci
+
+#Regression previsionnel
+
+kwargs = {
+    "column_name": "close",
+    "degree": 3,
+    "length": 10,
+    "extrapolate":11
+}
+
+def polynomial_regression_on_dataframe(df, **kwargs):
+    """
+    Applique une régression polynomiale sur un DataFrame et ajoute des colonnes supplémentaires
+    pour les coefficients, les prévisions, la direction de la tendance, et plus encore.
+    
+    Paramètres :
+        df (pd.DataFrame) : DataFrame d'entrée contenant les données sur lesquelles effectuer la régression.
+        **kwargs : Arguments supplémentaires pour configurer la régression.
+            - column_name (str) : Nom de la colonne sur laquelle effectuer la régression.
+            - degree (int) : Degré du polynôme pour la régression.
+            - length (int) : Nombre de points de données à utiliser pour la régression.
+            - extrapolate (int) : Nombre de points à extrapoler dans le futur.
+    
+    Retourne :
+        pd.DataFrame : DataFrame original avec des colonnes supplémentaires pour les résultats de la régression.
+    """
+    
+    # Fonction interne pour effectuer une régression polynomiale sur un ensemble de données.
+    def polynomial_regression(data):
+        x = np.arange(kwargs['length'])
+        coeffs = np.polyfit(x, data[-kwargs['length']:], kwargs['degree'])
+        return coeffs
+    
+    # Calculer les coefficients de régression polynomiale pour chaque fenêtre de données.
+    coeffs_list = []
+    for i in range(len(df)):
+        if i < kwargs['length'] - 1:
+            coeffs_list.append(np.nan)
+        else:
+            data = df[kwargs['column_name']].iloc[i-kwargs['length']+1:i+1].values
+            coeffs = polynomial_regression(data)
+            coeffs_list.append(coeffs)
+    df['coeffs'] = coeffs_list
+    
+    # Fonction interne pour calculer la prévision en utilisant les coefficients polynomiaux.
+    def polynomial_forecast(coeffs):
+        if not isinstance(coeffs, np.ndarray):
+            return np.nan
+        x = np.arange(kwargs['length'], kwargs['length'] + kwargs['extrapolate'])
+        forecast = np.polyval(coeffs, x)
+        return forecast[0] if len(forecast) > 0 else np.nan
+    
+    # Calculer la prévision pour chaque point de données.
+    df['forecast'] = df['coeffs'].apply(polynomial_forecast)
+    
+    # Fonction interne pour déterminer la direction de la tendance.
+    def direction_indicator(prev_val, current_val):
+        return 1 if current_val > prev_val else -1
+    
+    # Calculer la direction de la tendance pour chaque point de données.
+    df['direction'] = df['forecast'].diff().apply(lambda x: direction_indicator(0, x))
+    
+    # Vérifier si l'index est de type DatetimeIndex et effectuer une conversion si nécessaire.
+    if isinstance(df.index, pd.DatetimeIndex):
+        epoch_time_index = (df.index - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
+    else:
+        epoch_time_index = pd.RangeIndex(start=0, stop=len(df), step=1)
+    
+    # Identifier les points de données qui sont des extrapolations.
+    df['is_extrapolation'] = (epoch_time_index >= epoch_time_index[-kwargs['extrapolate']])
+    
+    # Assigner une couleur en fonction de la direction de la tendance et si le point est une extrapolation.
+    df['color'] = df.apply(lambda row: 'orange' if row['is_extrapolation'] else ('green' if row['direction'] == 1 else 'red'), axis=1)
+    
+    return df
+
+
+def extrapolation_direction(df, **kwargs):
+    # Extraire les valeurs extrapolées
+    extrapolated_values = df[kwargs['column_name']].iloc[-kwargs['extrapolate']:]
+    
+    # Calculer la moyenne des valeurs extrapolées
+    mean_extrapolated = extrapolated_values.mean()
+    
+    # Comparer la moyenne des valeurs extrapolées à la dernière valeur réelle avant l'extrapolation
+    last_real_value = df[kwargs['column_name']].iloc[-kwargs['extrapolate']-1]
+    
+    return 1 if mean_extrapolated > last_real_value else -1
+
+
+def performance_columns(df, **kwargs):
+    column_name = kwargs["column_name"]
+    length = kwargs["length"]
+    
+    if len(df) < length:
+        raise ValueError(f"DataFrame is shorter ({len(df)} rows) than the specified length ({length}).")
+    
+    predicted_trend = extrapolation_direction(df, **kwargs)
+    df_tail = df.tail(length)
+    
+    # Calcul du pourcentage total de bougies correctes
+    correct_predictions = ((df_tail['direction'] == predicted_trend) & (df_tail[column_name].diff() > 0)) | \
+                          ((df_tail['direction'] != predicted_trend) & (df_tail[column_name].diff() < 0))
+    df.loc[df_tail.index, 'correct_trend_pct'] = (correct_predictions.sum() / length) * 100
+    
+    # Calcul du pourcentage de bougies correctes pour les tendances haussières
+    correct_up_predictions = (df_tail['direction'] == 1) & (df_tail[column_name].diff() > 0)
+    df.loc[df_tail.index, 'correct_up_trend_pct'] = (correct_up_predictions.sum() / length) * 100
+    
+    # Calcul du pourcentage de bougies correctes pour les tendances baissières
+    correct_down_predictions = (df_tail['direction'] == -1) & (df_tail[column_name].diff() < 0)
+    df.loc[df_tail.index, 'correct_down_trend_pct'] = (correct_down_predictions.sum() / length) * 100
+    
+    # Calcul du gain (ou perte) cumulatif en % en suivant la tendance prédite
+    pct_changes = df_tail[column_name].pct_change().fillna(0)
+    trend_followed = (df_tail['direction'] == predicted_trend).astype(int) * 2 - 1
+    adjusted_gains = pct_changes * trend_followed
+    df.loc[df_tail.index, 'cumulative_gain_pct'] = (adjusted_gains + 1).cumprod().sub(1).mul(100)
+    
+    return df
+
+# Convertir les indicateurs en scores
+def indicator_to_score(value):
+    if pd.isna(value):
+        return 0
+    elif value <= -1.5:
+        return -2
+    elif -1.5 < value <= -0.5:
+        return -1
+    elif -0.5 < value < 0.5:
+        return 0
+    elif 0.5 <= value < 1.5:
+        return 1
+    else:
+        return 2
+
+# Convertir les scores en tendances
+def score_to_trend(score):
+    if score <= -1.5:
+        return "strong sell"
+    elif -1.5 < score <= -0.5:
+        return "sell"
+    elif -0.5 < score < 0.5:
+        return "neutral"
+    elif 0.5 <= score < 1.5:
+        return "buy"
+    else:
+        return "strong buy"
+
+# Poids d'indicateur
+INDICATOR_WEIGHTS = {
+    'Change%': 2,
+    'MACD%': 3,
+    'Chop%': 1,
+    'RSI%': 3,
+    'WILL%': 2,
+    'ST': 2,
+    'EMA1,2': 3,
+    'Boll': 3,
+    'RSIOS%': 2,
+    'OBV%': 3,
+    'SAR': 2,
+    'ATR%': 2,
+    'CMF%': 2,
+    'ICPA': 1,
+    'Diver': 2,
+    'FactRSICHANG%': 1,
+    'AO': 2,
+    'BBP': 2,
+    'SUO': 1,
+    'CCI': 2
+}
+
+# Calculer le score moyen pour chaque ligne
+def calculate_average_score(row):
+    total_score = 0
+    total_weight = 0
+    for indicator, weight in INDICATOR_WEIGHTS.items():
+        if f"{indicator}_score" in row.index:
+            total_score += row[f"{indicator}_score"] * weight
+            total_weight += weight
+    return total_score / total_weight if total_weight != 0 else 0
+
+#score bougie 
+historique = 50
+def indicateur_bougie(bougies, historique):
+    # On limite la liste des bougies à l'historique demandé
+    bougies = bougies[-historique:]
+
+    bougies_positives = [b for b in bougies if b > 0]
+    bougies_negatives = [-b for b in bougies if b < 0]
+
+    if not bougies_positives:
+        moyenne_positive = 0
+    else:
+        moyenne_positive = sum(bougies_positives) / len(bougies_positives)
+    
+    if not bougies_negatives:
+        moyenne_negative = 0
+    else:
+        moyenne_negative = sum(bougies_negatives) / len(bougies_negatives)
+
+    # Dernière bougie
+    bougie_actuelle = bougies[-1]
+
+    # Application des règles
+    if bougie_actuelle < 0:
+        if abs(bougie_actuelle) > moyenne_negative:
+            return "Strong Sell"
+        else:
+            return "Sell"
+    elif bougie_actuelle > 0:
+        if bougie_actuelle > moyenne_positive:
+            return "Strong Buy"
+        else:
+            return "Buy"
+    else:
+        return "Neutre"
+
+# Exemple
+bougies = [1, 2, -3, 4, -2, 1, -5, 6, 3, -4]
+
+def apply_indicator(row):
+    # Supposons que vous voulez un historique de 5 bougies
+    
+    # Obtenez la position de la ligne actuelle dans le DataFrame
+    current_position = df.index.get_loc(row.name)
+    
+    # Utilisez 'iloc' pour obtenir les 5 dernières bougies avant la bougie actuelle
+    last_n_closes = df['close'].iloc[current_position - historique:current_position].tolist()
+    
+    # Si vous avez moins de 5 bougies (par exemple, au début du dataframe), retournez 'Neutre' ou NaN
+    if len(last_n_closes) < historique:
+        return 'Neutre'  # ou return np.nan
+
+    return indicateur_bougie(last_n_closes, historique)
+
+def calculate_parabolic_sar(data, start, increment, maximum):
+    # Assurez-vous que les colonnes 'high' et 'low' existent dans les données
+    if 'high' not in data.columns or 'low' not in data.columns:
+        raise ValueError("Les données de prix doivent contenir les colonnes 'high' et 'low'.")
+
+    # Utilisez TA-Lib pour calculer le Parabolic SAR
+    sar = talib.SAR(data['high'], data['low'], acceleration=start, maximum=maximum)
+
+    # Créez une colonne pour les signaux (rouge ou vert)
+    signals = []
+    for i in range(len(data)):
+        if i == 0:
+            signals.append(0)  # Première valeur indéterminée
+        elif sar[i] < data['close'].iloc[i]:
+            signals.append(1)  # Vert
+        else:
+            signals.append(-1)  # Rouge
+
+    return signals
+
+
+# Fonction pour calculer le filtre gaussien
+def gaussian_filter(src, period):
+    std_dev = src.rolling(period).std()
+    filtered_src = src.copy()
+    
+    for i in range(period, len(src)):
+        if abs(src[i] - src[i - 1]) < std_dev[i]:
+            filtered_src[i] = filtered_src[i - 1]
+    
+    return filtered_src
+
+# Fonction pour calculer le filtre N-Pole
+def npole_filter(src, period, order):
+    coeffs = np.zeros((order + 1, 3))
+    a = calculate_alpha(period, order)
+    
+    for r in range(order + 1):
+        out = np.math.factorial(order) / (np.math.factorial(order - r) * np.math.factorial(r))
+        coeffs[r][0] = out
+        coeffs[r][1] = pow(a, r)
+        coeffs[r][2] = pow(1.0 - a, r)
+    
+    filtered_src = src.copy()
+    sign = 1
+    
+    for i in range(1, len(src)):
+        filt = src[i] * coeffs[order][1]
+        
+        for r in range(1, order + 1):
+            filt += sign * coeffs[r][0] * coeffs[r][2] * filtered_src[i - r]
+            sign *= -1
+        
+        filtered_src[i] = filt
+    
+    return filtered_src
+
+# Fonction pour calculer le paramètre alpha
+def calculate_alpha(period, order):
+    w = 2.0 * np.pi / period
+    b = (1.0 - np.cos(w)) / (pow(1.414, 2.0 / order) - 1.0)
+    a = -b + np.sqrt(b * b + 2.0 * b)
+    return a
+
+# Fonction principale pour générer des signaux
+def generate_signals(src, period, order, filter_option, filter_dev, filter_period):
+    filtered_src = src.copy()
+    
+    if filter_option == "Both" or (filter_option == "Price" and filter_dev > 0):
+        filtered_src = gaussian_filter(filtered_src, filter_period)
+    
+    filtered_src = npole_filter(filtered_src, period, order)
+    
+    if filter_option == "Both" or (filter_option == "Gaussian Filter" and filter_dev > 0):
+        filtered_src = gaussian_filter(filtered_src, filter_period)
+        
+    signals = [0]  # Le premier signal est indéterminé
+    for i in range(1, len(src)):
+        if filtered_src[i] > filtered_src[i - 1]:
+            signals.append(1)
+        elif filtered_src[i] < filtered_src[i - 1]:
+            signals.append(-1)
+        else:
+            signals.append(0)
+    
+    return signals
+
+
+
+print("Data loaded def indicateur 100%")
+# -- Exponential Moving Average --
+df['EMA1']= ta.trend.ema_indicator(close=df['close'], window=1)
+df['EMA2']= ta.trend.ema_indicator(close=df['close'], window=2)
+df['EMA3']= ta.trend.ema_indicator(close=df['close'], window=50)
+df['EMA4']= ta.trend.ema_indicator(close=df['close'], window=100)
+df['EMA5']= ta.trend.ema_indicator(close=df['close'], window=121)
+df['EMA6']= ta.trend.ema_indicator(close=df['close'], window=600)
+
+# Super Trend
+ST_length = 10
+ST_multiplier = 1.4
+superTrend = pda.supertrend(high=df['high'], low=df['low'], close=df['close'], length=ST_length, multiplier=ST_multiplier)
+df['SUPER_TREND_DIRECTION'] = superTrend['SUPERTd_'+str(ST_length)+"_"+str(ST_multiplier)] #Retourne 1 si vert et -1 si rouge
+
+# -- Stochasitc RSI --
+df['STOCH_RSI'] = ta.momentum.stochrsi(close=df['close'], window=14, smooth1=3, smooth2=3)
+df['STOCH_RSI_D'] = ta.momentum.stochrsi_d(close=df['close'], window=14, smooth1=3, smooth2=3) #Orange sur TradingView
+df['STOCH_RSI_K'] =ta.momentum.stochrsi_k(close=df['close'], window=14, smooth1=3, smooth2=3) #Bleu sur TradingView
+
+# Choppiness index
+df['CHOP'] = get_chop(high=df['high'], low=df['low'], close=df['close'], window=14)
+
+# Choppiness index %
+df['CHOP100'] = df['CHOP'].apply(chopiness_to_percentage)
+df['CHOP100 diff'] = chop_diff(df)
+df['STOCH_RSI diff'] = rsi_diff(df)
+df["ChopRsiDiff"] = (chop_diff(df) / rsi_diff(df))*100
+df['WillR'] = ta.momentum.williams_r(high=df['high'], low=df['low'], close=df['close'], lbp=14)
+df['WillRPositive']= df['WillR']+100
+
+# -- Indicators, you can edit every value --
+df['close'] = df['close'].astype(float)
+df['high'] = df['high'].astype(float)
+df['low'] = df['low'].astype(float)
+df['open'] = df['open'].astype(float)
+df['volume'] = df['volume'].astype(float)
+df['SMA1'] = talib.SMA(df['close'], timeperiod=10)
+df['SMA2'] = talib.SMA(df['close'], timeperiod=14)
+df['RSI'] = talib.RSI(df['close'], timeperiod=14)
+df['ADX'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
+df['MACD'], df['Signal Line'], _ = talib.MACD(df['close'])
+df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+df['Stochastic Oscillator %K'], df['Stochastic Oscillator %D'] = talib.STOCH(df['high'], df['low'], df['close'])
+df['Williams %R'] = talib.WILLR(df['high'], df['low'], df['close'], timeperiod=14)
+df['Momentum'] = talib.MOM(df['close'], timeperiod=10)
+df['ADXR'] = talib.ADXR(df['high'], df['low'], df['close'], timeperiod=14)
+df['ADXR_prev']= df['ADXR'].shift(1)
+df['ADXR%']= (df['ADXR'] - df['ADXR_prev']) / df['ADXR_prev'] * 100
+
+df['HT_DCPERIOD'] = talib.HT_DCPERIOD(df['close'])
+
+# Calculs supplémentaires
+df['AD'] = ((2 * df['close'] - df['low'] - df['high']) / (df['high'] - df['low'])) * df['volume']
+df['AD_EMA'] = df['AD'].ewm(span=3, adjust=False).mean()
+df['Volatility_Chaikin'] = df['AD_EMA'].rolling(window=10).std()
+df['CDLMARUBOZU'] = talib.CDLMARUBOZU(df['open'], df['high'], df['low'], df['close'])
+df['CDLDOJI'] = talib.CDLDOJI(df['open'], df['high'], df['low'], df['close'])
+df['CDLHARAMI'] = talib.CDLHARAMI(df['open'], df['high'], df['low'], df['close'])
+df['ThreeOutsideUp/Down'] = talib.CDL3OUTSIDE(df['open'], df['high'], df['low'], df['close'])
+df['HT Phasor Inphase'], df['HT Phasor Quadrature'] = talib.HT_PHASOR(df['close'])
+df['Hikkake Pattern'] = talib.CDLHIKKAKE(df['open'], df['high'], df['low'], df['close'])
+df['TEMA'] = talib.TEMA(df['close'], timeperiod=14)
+df['TRIMA'] = talib.TRIMA(df['close'], timeperiod=14)
+df['KAMA'] = talib.KAMA(df['close'], timeperiod=14)
+# Exemple de calcul des Bandes de Bollinger
+df['rolling_mean'] = df['close'].rolling(window=20).mean()
+df['rolling_std'] = df['close'].rolling(window=20).std()
+
+# Assurez-vous que ces lignes sont présentes avant d'utiliser `upper_band` et `lower_band`
+df['upper_band'] = df['rolling_mean'] + (df['rolling_std'] * 2)  # Exemple de calcul de bande supérieure
+df['lower_band'] = df['rolling_mean'] - (df['rolling_std'] * 2)  #
+     
+df['bollinger_signal'] = np.where(df['close'] > df['upper_band'], 1, np.where(df['close'] < df['lower_band'], -1, 0))
+df['chopiness'] = get_chopiness(df)
+df['chopiness_prev'] = df['chopiness'].shift(1)
+# Ajouter cette logique pour 'Chop%'
+latest_data = df.iloc[-1]
+current_chopiness = latest_data['chopiness']
+previous_chopiness = df.iloc[-2]['chopiness']
+
+if current_chopiness < 30:
+    chop_pct = 100
+elif current_chopiness > 70:
+        chop_pct = 0
+else:
+    chop_pct = (current_chopiness - previous_chopiness) / previous_chopiness * 100
+            
+
+retracement_levels = get_fibonacci_retracement(df)
+
+# Fonction pour calculer le filtre gaussien
+period = 25
+order = 5
+filter_option = "Gaussian Filter"
+filter_dev = 1
+filter_period = 10
+
+signals_STD = generate_signals(df['close'], period, order, filter_option, filter_dev, filter_period)
+df['STD_signal']= signals_STD
+
+# Utilisez la fonction calculate_parabolic_sar pour générer les signaux
+start = 0.02
+increment = 0.02
+maximum = 0.2
+signals_parabolic_sar = calculate_parabolic_sar(df, start, increment, maximum)
+
+# Ajoutez les signaux dans une nouvelle colonne 'parabolic_sar_signal'
+df['parabolic_sar_signal'] = signals_parabolic_sar
+
+df['rsi'] = get_rsi(df)
+df['Change%'] = price_percent_diff(df)
+df['rsi_prev'] = df['rsi'].shift(1)
+df['RSI%'] = rsi_percent(df)
+df['williams_r'] = get_williams_r(df)
+df['williams_r_prev'] = df['williams_r'].shift(1)
+df['ema_diff'] = get_ema_diff(df)
+# Calculer le MACD% comme la différence relative entre le MACD actuel et le précédent
+df['macd'], df['macd_signal'] = get_macd(df)
+df['macd_prev'] = df['macd'].shift(1)
+df['macd%'] = (df['macd'] - df['macd_prev']) / df['macd_prev'] * 100
+# Calcule du RSI Oscillateur RSI%
+df['slowk'], df['slowd'] = get_stochastic_oscillator(df)
+df['RSIOS%'] = (df['slowk'] - df['slowd']) / df['slowd'] * 100
+# Calcule OBV%
+df['volume'] = df['volume'].astype(float)
+df['close'] = df['close'].astype(float)
+df['OBV'] = talib.OBV(df['close'], df['volume'])
+df['OBV'] = (np.sign(df['close'].diff(1).fillna(0)) * df['volume']).cumsum()
+df['OBV_prev'] = df['OBV'].shift(1)
+df['OBV%'] = ((df['OBV_prev'] - df['OBV']) / df['OBV']) * 100
+# Calcule SAR Direction
+df['SAR_direction'] = get_sar_direction(df)
+# Calcule ATR%
+df['ATR%'] = get_atr_percent_diff(df)
+df['CMF%'] = get_cmf_percent_diff(df)
+df['ICPA'] = ICPA(df)
+df['Bougie'] = [0] + [bougie(df.iloc[i]['close'], df.iloc[i-1]['close']) for i in range(1, len(df))]
+df['TempDivergence'] = df.apply(single_period_divergence, axis=1)
+df['Divergence'] = [0] + [final_divergence(df.iloc[i], df.iloc[i-1]) for i in range(1, len(df))]
+df['FactRSICHANG%'] = compute_FactRSICHANG_percent(df)
+df['AO'] = awesome_oscillator(df)
+df['BBP']= bull_bear_power(df)
+df['SUO']= simple_ultimate_oscillator(df)
+df['CCI']= compute_cci(df)
+# Colonne de prédilection et % de leur reussite 
+df = polynomial_regression_on_dataframe(df, **kwargs)
+direction = extrapolation_direction(df, **kwargs)
+            
+df['Forecast Trend'] = direction
+# Utilisation de la fonction avec un DataFrame:
+df = performance_columns(df, **kwargs)
+df['IndicateurBougie'] = df.apply(apply_indicator, axis=1)
+
+# Convertir les valeurs d'indicateur en scores
+for indicator in INDICATOR_WEIGHTS.keys():
+    if indicator in df.columns:
+        df[f"{indicator}_score"] = df[indicator].apply(indicator_to_score)
+            
+df['Average Score'] = df.apply(calculate_average_score, axis=1)
+# Appliquer score_to_trend pour obtenir la recommandation
+df['Recommendation'] = df['Average Score'].apply(score_to_trend)
+df['WILL%']: (df['williams_r'] - df['williams_r_prev']) / df['williams_r_prev']
+print("Indicators loaded 100%")
+
+df
+# Liste des familles d'indicateurs avec leurs valeurs
+sentiment_indicators = ['IndicateurBougie', 'Recommendation']
+binary_indicators = ['SUPER_TREND_DIRECTION', 'Forecast Trend', 'Bougie', 'SAR_direction', 'bougie', 'STD_signal', 'slowk',
+                     'slowd']
+triple_indicators = ['bollinger_signal', 'Divergence','parabolic_sar_signal']
+
+# Définir les sous-familles pour les indicateurs de moyenne mobile
+moving_average_subfamilies = {
+    'EMA': ['EMA1', 'EMA2', 'EMA3', 'EMA4', 'EMA5', 'EMA6'],
+    'SMA': ['SMA1', 'SMA2'],
+    'Special_MA': ['AD_EMA', 'TEMA', 'TRIMA', 'KAMA'],
+    'Stochastic_Indicators': ['STOCH_RSI_D', 'STOCH_RSI_K', 'Stochastic Oscillator %D', 'Stochastic Oscillator %K']
+}
+pctchange_indicators = ['Change%', 'RSI%', 'RSIOS%', 'ATR%', 'CMF%', 'WILL%', 'CHOP100 diff', 'FactRSICHANG%','macd%','ADXR%']
+classic_indicators = ['CHOP', 'WillRPositive', 'RSI', 'CDLHARAMI']
+zero_indicators = ['ADX', 'MACD', 'Signal Line', 'Momentum', 'Volatility_Chaikin', 'CDLMARUBOZU', 'CDLDOJI',
+                   'ThreeOutsideUp/Down', 'TEMA', 'AO', 'BBP', 'SUO', 'CCI', 'OBV', 'Change%', 'RSI%', 'RSIOS%', 'ATR%', 'CMF%', 'WILL%','macd%','ADXR%']
+prev_indicateur = ['macd_prev', 'OBV_prev', 'williams_r_prev', 'chopiness_prev']
+
+# Liste des valeurs ou conditions que peuvent utiliser ces familles
+indicators = {
+    'Sentiment Indicators': {indicator: {'type': 'candlestick', 'values': ['strong sell', 'sell', 'neutral', 'buy', 'strong buy'], 'comparison': '=='} for indicator in sentiment_indicators},
+    'Binary Indicators': {indicator: {'type': 'direction', 'values': [1, -1], 'comparison': '=='} for indicator in binary_indicators},
+    'Triple_indicator': {indicator: {'type': 'direction', 'values': [1,0, -1], 'comparison': '=='} for indicator in triple_indicators},
+    'Moving Average Indicators': {subfamily: {'type': 'price','comparisons': ['<', '>'] } for subfamily in moving_average_subfamilies.keys()},
+    'Percentage Change Indicators': {indicator: {'type': 'percentage_change', 'min': -100, 'max': 100, 'comparisons': ['<', '>', '<=', '>=', '==']} for indicator in pctchange_indicators},
+    'Classic Indicators': {indicator: {'type': 'price', 'min': 0, 'max': 100, 'comparisons': ['<', '>', '<=', '>=', '==']} for indicator in classic_indicators},
+    'Zero Indicators': {indicator: {'type': 'price', 'min': 0, 'max': 0, 'comparisons': ['<', '>']} for indicator in zero_indicators},
+    'Prev Indicator': {indicator: {'type': 'price', 'min': None, 'max': None, 'comparisons': ['<', '>']} for indicator in prev_indicateur}
+}
+logicals = ['and', 'or']
+import random
+
+def generate_strategy(indicators, num_indicators):
+    """
+    Génère des stratégies d'investissement en fonction des indicateurs fournis.
+
+    :param indicators: Dictionnaire des indicateurs disponibles.
+    :param num_indicators: Nombre d'indicateurs à sélectionner pour chaque famille.
+    :return: Stratégies d'investissement.
+    """
+    
+    # Initialisation du dictionnaire des stratégies
+    strategies = {
+        'OpenLong': [],
+        'CloseLong': [],
+        'OpenShort': [],
+        'CloseShort': []
+    }
+
+    # Boucle sur chaque famille d'indicateurs pour générer les scénarios
+    for family, count in num_indicators.items():
+        selected_indicators = random.sample(list(indicators[family].keys()), count)
+
+        for indicator_name in selected_indicators:
+            indicator_info = indicators[family][indicator_name]
+            row_indicator = f"row['{indicator_name}']"
+
+            # Traitement des indicateurs de sentiment
+            if family == "Sentiment Indicators":
+                scenarios = [
+                    {'OpenLong': 'buy', 'CloseLong': 'neutral', 'OpenShort': 'sell', 'CloseShort': 'neutral'},
+                    {'OpenLong': 'strong buy', 'CloseLong': 'buy', 'OpenShort': 'strong sell', 'CloseShort': 'sell'},
+                    {'OpenLong': 'strong buy', 'CloseLong': 'neutral', 'OpenShort': 'strong sell', 'CloseShort': 'neutral'},
+                    {'OpenLong': 'strong sell', 'CloseLong': 'buy', 'OpenShort': 'strong buy', 'CloseShort': 'sell'},
+                    {'OpenLong': 'strong sell', 'CloseLong': 'neutral', 'OpenShort': 'strong buy', 'CloseShort': 'neutral'},
+                ]
+
+                selected_scenario = random.choice(scenarios)
+                for action, value in selected_scenario.items():
+                    strategies[action].append(f"row['Recommendation'] == '{value}'")
+
+            # Traitement des indicateurs binaires
+            elif family == "Binary Indicators":
+                logic_type = random.choice([1, 2])
+                if logic_type == 1:
+                    strategies['OpenLong'].append(f"{row_indicator} == 1")
+                    strategies['OpenShort'].append(f"{row_indicator} == -1")
+                    strategies['CloseLong'].append(f"{row_indicator} == -1")
+                    strategies['CloseShort'].append(f"{row_indicator} == 1")
+                else:
+                    strategies['OpenLong'].append(f"{row_indicator} == -1")
+                    strategies['OpenShort'].append(f"{row_indicator} == 1")
+                    strategies['CloseLong'].append(f"{row_indicator} == 1")
+                    strategies['CloseShort'].append(f"{row_indicator} == -1")
+            # Traitement pour Triple Indicators
+            elif family == "Triple_indicator":
+                logic_type = random.choice([1, 2])
+                if logic_type == 1:
+                    strategies['OpenLong'].append(f"{row_indicator} == 1")
+                    strategies['CloseLong'].append(f"{row_indicator} == 0")
+                    strategies['OpenShort'].append(f"{row_indicator} == -1")
+                    strategies['CloseShort'].append(f"{row_indicator} == 0")
+                else:
+                    strategies['OpenLong'].append(f"{row_indicator} == -1")
+                    strategies['CloseLong'].append(f"{row_indicator} == 0")
+                    strategies['OpenShort'].append(f"{row_indicator} == 1")
+                    strategies['CloseShort'].append(f"{row_indicator} == 0")
+
+            # Traitement pour Moving Average Indicators
+            elif family == "Moving Average Indicators":
+                chosen_subfamily = random.choice(list(indicators[family].keys()))
+                chosen_indicators = random.sample(moving_average_subfamilies[chosen_subfamily], 2)
+                comparison = random.choice(indicator_info['comparisons'])
+
+                first_indicator = f"row['{chosen_indicators[0]}']"
+                second_indicator = f"row['{chosen_indicators[1]}']"
+
+                if comparison == '<':
+                    strategies['OpenLong'].append(f"{first_indicator} > {second_indicator}")
+                    strategies['CloseLong'].append(f"{first_indicator} < {second_indicator}")
+                    strategies['OpenShort'].append(f"{first_indicator} < {second_indicator}")
+                    strategies['CloseShort'].append(f"{first_indicator} > {second_indicator}")
+                else:
+                    strategies['OpenLong'].append(f"{first_indicator} < {second_indicator}")
+                    strategies['CloseLong'].append(f"{first_indicator} > {second_indicator}")
+                    strategies['OpenShort'].append(f"{first_indicator} > {second_indicator}")
+                    strategies['CloseShort'].append(f"{first_indicator} < {second_indicator}")
+
+            # Traitement pour Zero Indicators
+            elif family == "Zero Indicators":
+                comparison = random.choice(indicator_info['comparisons'])
+
+                if comparison == '<':
+                    strategies['OpenLong'].append(f"{row_indicator} > 0")
+                    strategies['CloseLong'].append(f"{row_indicator} <= 0")
+                    strategies['OpenShort'].append(f"{row_indicator} < 0")
+                    strategies['CloseShort'].append(f"{row_indicator} >= 0")
+                else:
+                    strategies['OpenLong'].append(f"{row_indicator} <= 0")
+                    strategies['CloseLong'].append(f"{row_indicator} > 0")
+                    strategies['OpenShort'].append(f"{row_indicator} >= 0")
+                    strategies['CloseShort'].append(f"{row_indicator} < 0")
+
+            # Traitement pour Percentage Change Indicators
+            elif family == "Percentage Change Indicators":
+                if indicator_name == "chop_pct":
+                    open_value = random.uniform(1, 15)
+                    close_value = -random.uniform(1, 15)
+
+                    strategies['OpenLong'].append(f"{row_indicator} > {open_value:.2f}")
+                    strategies['CloseLong'].append(f"{row_indicator} < {close_value:.2f}")
+                    strategies['OpenShort'].append(f"{row_indicator} > {open_value:.2f}")
+                    strategies['CloseShort'].append(f"{row_indicator} < {close_value:.2f}")
+                else:
+                    comparison = random.choice(indicator_info['comparisons'])
+                    logic_type = random.choice([1, 2])  
+
+                    if logic_type == 1:
+                        value = random.uniform(1, 15)
+                        strategies['OpenLong'].append(f"{row_indicator} > {value:.2f}")
+                        strategies['CloseLong'].append(f"{row_indicator} < {-value:.2f}")
+                        strategies['OpenShort'].append(f"{row_indicator} < {-value:.2f}")
+                        strategies['CloseShort'].append(f"{row_indicator} > {value:.2f}")
+                    else:
+                        value1 = random.uniform(1, 15)
+                        value2 = random.uniform(1, 15)
+                        strategies['OpenLong'].append(f"{row_indicator} > {value1:.2f}")
+                        strategies['CloseLong'].append(f"{row_indicator} < {-value2:.2f}")
+                        strategies['OpenShort'].append(f"{row_indicator} < {-value1:.2f}")
+                        strategies['CloseShort'].append(f"{row_indicator} > {value2:.2f}")
+
+            # Traitement pour Classic Indicators
+            elif family == "Classic Indicators":
+                comparison = random.choice(indicator_info['comparisons'])
+                value = random.uniform(1, 100)
+
+                if comparison == '<':
+                    strategies['OpenLong'].append(f"{row_indicator} > {value:.2f}")
+                    strategies['CloseLong'].append(f"{row_indicator} < {value:.2f}")
+                    strategies['OpenShort'].append(f"{row_indicator} < {value:.2f}")
+                    strategies['CloseShort'].append(f"{row_indicator} > {value:.2f}")
+                else:
+                    strategies['OpenLong'].append(f"{row_indicator} < {value:.2f}")
+                    strategies['CloseLong'].append(f"{row_indicator} > {value:.2f}")
+                    strategies['OpenShort'].append(f"{row_indicator} > {value:.2f}")
+                    strategies['CloseShort'].append(f"{row_indicator} < {value:.2f}")
+
+
+
+    # Assembler chaque stratégie en une seule chaîne
+    for action, strategy_list in strategies.items():
+        strategies[action] = ' and '.join(strategy_list)
+
+    return strategies
+
+# Test
+num_indicators = {
+    'Sentiment Indicators': 0,
+    'Binary Indicators': 0,
+    'Triple_indicator': 0,
+    'Moving Average Indicators': 0,
+    'Percentage Change Indicators': 0,
+    'Classic Indicators': 0,
+    'Zero Indicators': 0,
+    'Prev Indicator': 0
+}
+
+generated_strategies = generate_strategy(indicators, num_indicators)
+for action, strategy in generated_strategies.items():
+    print(f"{action} Strategy: {strategy}\n")
+
+def determine_num_indicators():
+    """ Déterminez combien d'indicateurs seront utilisés par famille."""
+    total_indicators = random.randint(1, 4)
+    families = list(indicators.keys())
+    num_indicators = {family: 0 for family in families}
+
+    for _ in range(total_indicators):
+        chosen_family = random.choice(families)
+        num_indicators[chosen_family] += 1
+
+    return num_indicators
+
+num_indicators = determine_num_indicators()
+
+print("Symbol:", symbol)
+print("Interval:", interval)
+print("Start Date", start_date)
+print("Leverage:", leverage)
+print("Wallet:", wallet)
+generated_strategies = generate_strategy(indicators, num_indicators)
+for action, strategy in generated_strategies.items():
+    print(f"{action} Strategy: {strategy}\n")
+
+dfTest = df.copy()
+
+# -- If you want to run your BackTest on a specific period, uncomment the line below --
+# dfTest = df['2021-03-01':'2021-09-01']
+
+# -- Definition of dt, that will be the dataset to do your trades analyses --
+dt = None
+dt = pd.DataFrame(columns=['date', 'position', 'reason',
+                           'price', 'frais', 'wallet', 'drawBack'])
+
+def openLongCondition(row, previousRow):
+    return eval(generated_strategies["OpenLong"])
+
+def closeLongCondition(row, previousRow):
+    return eval(generated_strategies["CloseLong"])
+
+def openShortCondition(row, previousRow):
+    return eval(generated_strategies["OpenShort"])
+
+def closeShortCondition(row, previousRow):
+    return eval(generated_strategies["CloseShort"])
+
+# -- Iteration on all your price dataset (df) --
+for index, row in dfTest.iterrows():
+
+    # -- If there is an order in progress --
+    if orderInProgress != '':
+        # -- Check if there is a LONG order in progress --
+        if orderInProgress == 'LONG':
+            # -- Check Liquidation --
+            if row['low'] < longLiquidationPrice:
+                print('/!\ YOUR LONG HAVE BEEN LIQUIDATED the',index)
+                break
+            
+            # -- Check If you have to close the LONG --
+            if closeLongCondition(row, previousRow) == True:
+                orderInProgress = ''
+                closePrice = row['close']
+                closePriceWithFee = row['close'] - takerFee * row['close']
+                pr_change = (closePriceWithFee - longIniPrice) / longIniPrice
+                wallet = wallet + wallet*pr_change*leverage
+
+                # -- You can uncomment the line below if you want to see logs --
+                # print('Close LONG at',closePrice,"the", index, '| wallet :', wallet,
+                #       '| result :', pr_change*100*leverage)
+
+
+                # -- Check if your wallet hit a new ATH to know the drawBack --
+                if wallet > lastAth:
+                    lastAth = wallet
+                
+                # -- Add the trade to DT to analyse it later --
+                myrow = {'date': index, 'position': "LONG", 'reason': 'Close Long Market', 'price': closePrice,
+                        'frais': takerFee * wallet * leverage, 'wallet': wallet, 'drawBack': (wallet-lastAth)/lastAth}
+                dt = pd.concat([dt, pd.DataFrame([myrow])], ignore_index=True)
+
+        # -- Check if there is a SHORT order in progress --
+        elif orderInProgress == 'SHORT':
+            # -- Check Liquidation --
+            if row['high'] > shortLiquidationPrice:
+                print('/!\ YOUR SHORT HAVE BEEN LIQUIDATED the',index)
+                break
+
+            # -- Check If you have to close the SHORT --
+            if closeShortCondition(row, previousRow) == True:
+                orderInProgress = ''
+                closePrice = row['close']
+                closePriceWithFee = row['close'] + takerFee * row['close']
+                pr_change = -(closePriceWithFee - shortIniPrice) / shortIniPrice
+                wallet = wallet + wallet*pr_change*leverage
+
+                # -- You can uncomment the line below if you want to see logs --
+                # print('Close SHORT at',closePrice,"the", index, '| wallet :', wallet,
+                #       '| result :', pr_change*100*leverage)
+
+                # -- Check if your wallet hit a new ATH to know the drawBack --
+                if wallet > lastAth:
+                    lastAth = wallet
+
+                # -- Add the trade to DT to analyse it later --
+                myrow = {'date': index, 'position': "SHORT", 'reason': 'Close Short Market', 'price': closePrice,
+                        'frais': takerFee * wallet * leverage, 'wallet': wallet, 'drawBack': (wallet-lastAth)/lastAth}
+                dt = dt.append(myrow, ignore_index=True)
+
+    # -- If there is NO order in progress --
+    if orderInProgress == '':
+        # -- Check If you have to open a LONG --
+        if openLongCondition(row, previousRow) == True:
+            orderInProgress = 'LONG'
+            closePrice = row['close']
+            longIniPrice = row['close'] + takerFee * row['close']
+            tokenAmount = (wallet * leverage) / row['close']
+            longLiquidationPrice = longIniPrice - (wallet/tokenAmount)
+
+            # -- You can uncomment the line below if you want to see logs --
+            # print('Open LONG at', closePrice, '$ the', index, '| Liquidation price :', longLiquidationPrice)
+
+            # -- Add the trade to DT to analyse it later --
+            myrow = {'date': index, 'position': "Open Long", 'reason': 'Open Long Market', 'price': closePrice,
+                     'frais': takerFee * wallet * leverage, 'wallet': wallet, 'drawBack': (wallet-lastAth)/lastAth}
+            dt = pd.concat([dt, pd.DataFrame([myrow])], ignore_index=True)
+        
+        # -- Check If you have to open a SHORT --
+        if openShortCondition(row, previousRow) == True:
+            orderInProgress = 'SHORT'
+            closePrice = row['close']
+            shortIniPrice = row['close'] - takerFee * row['close']
+            tokenAmount = (wallet * leverage) / row['close']
+            shortLiquidationPrice = shortIniPrice + (wallet/tokenAmount)
+            # -- You can uncomment the line below if you want to see logs --
+            # print('Open SHORT', closePrice, '$ the', index, '| Liquidation price :', shortLiquidationPrice)
+
+            # -- Add the trade to DT to analyse it later --
+            myrow = {'date': index, 'position': "Open Short", 'reason': 'Open Short Market', 'price': closePrice,
+                     'frais': takerFee * wallet * leverage, 'wallet': wallet, 'drawBack': (wallet-lastAth)/lastAth}
+            dt = dt.append(myrow, ignore_index=True)
+
+
+# -- BackTest Analyses --
+dt = dt.set_index(dt['date'])
+dt.index = pd.to_datetime(dt.index)
+dt['resultat%'] = dt['wallet'].pct_change()*100
+
+dt['tradeIs'] = ''
+dt.loc[dt['resultat%'] > 0, 'tradeIs'] = 'Good'
+dt.loc[dt['resultat%'] < 0, 'tradeIs'] = 'Bad'
+
+iniClose = dfTest.iloc[0]['close']
+lastClose = dfTest.iloc[len(dfTest)-1]['close']
+holdPercentage = ((lastClose - iniClose)/iniClose)
+holdWallet = holdPercentage * leverage * initialWallet
+algoPercentage = ((wallet - initialWallet)/initialWallet)
+vsHoldPercentage = ((wallet - holdWallet)/holdWallet) * 100
+
+try:
+    tradesPerformance = round(dt.loc[(dt['tradeIs'] == 'Good') | (dt['tradeIs'] == 'Bad'), 'resultat%'].sum()
+            / dt.loc[(dt['tradeIs'] == 'Good') | (dt['tradeIs'] == 'Bad'), 'resultat%'].count(), 2)
+except:
+    tradesPerformance = 0
+    print("/!\ There is no Good or Bad Trades in your BackTest, maybe a problem...")
+
+try:
+    TotalGoodTrades = dt.groupby('tradeIs')['date'].nunique()['Good']
+    AveragePercentagePositivTrades = round(dt.loc[dt['tradeIs'] == 'Good', 'resultat%'].sum()
+                                           / dt.loc[dt['tradeIs'] == 'Good', 'resultat%'].count(), 2)
+    idbest = dt.loc[dt['tradeIs'] == 'Good', 'resultat%'].idxmax()
+    bestTrade = str(
+        round(dt.loc[dt['tradeIs'] == 'Good', 'resultat%'].max(), 2))
+except:
+    TotalGoodTrades = 0
+    AveragePercentagePositivTrades = 0
+    idbest = ''
+    bestTrade = 0
+    print("/!\ There is no Good Trades in your BackTest, maybe a problem...")
+
+try:
+    TotalBadTrades = dt.groupby('tradeIs')['date'].nunique()['Bad']
+    AveragePercentageNegativTrades = round(dt.loc[dt['tradeIs'] == 'Bad', 'resultat%'].sum()
+                                           / dt.loc[dt['tradeIs'] == 'Bad', 'resultat%'].count(), 2)
+    idworst = dt.loc[dt['tradeIs'] == 'Bad', 'resultat%'].idxmin()
+    worstTrade = round(dt.loc[dt['tradeIs'] == 'Bad', 'resultat%'].min(), 2)
+except:
+    TotalBadTrades = 0
+    AveragePercentageNegativTrades = 0
+    idworst = ''
+    worstTrade = 0
+    print("/!\ There is no Bad Trades in your BackTest, maybe a problem...")
+
+totalTrades = TotalBadTrades + TotalGoodTrades
+
+try:
+    TotalLongTrades = dt.groupby('position')['date'].nunique()['LONG']
+    AverageLongTrades = round(dt.loc[dt['position'] == 'LONG', 'resultat%'].sum()
+                              / dt.loc[dt['position'] == 'LONG', 'resultat%'].count(), 2)
+    idBestLong = dt.loc[dt['position'] == 'LONG', 'resultat%'].idxmax()
+    bestLongTrade = str(
+        round(dt.loc[dt['position'] == 'LONG', 'resultat%'].max(), 2))
+    idWorstLong = dt.loc[dt['position'] == 'LONG', 'resultat%'].idxmin()
+    worstLongTrade = str(
+        round(dt.loc[dt['position'] == 'LONG', 'resultat%'].min(), 2))
+except:
+    AverageLongTrades = 0
+    TotalLongTrades = 0
+    bestLongTrade = ''
+    idBestLong = ''
+    idWorstLong = ''
+    worstLongTrade = ''
+    print("/!\ There is no LONG Trades in your BackTest, maybe a problem...")
+
+try:
+    TotalShortTrades = dt.groupby('position')['date'].nunique()['SHORT']
+    AverageShortTrades = round(dt.loc[dt['position'] == 'SHORT', 'resultat%'].sum()
+                               / dt.loc[dt['position'] == 'SHORT', 'resultat%'].count(), 2)
+    idBestShort = dt.loc[dt['position'] == 'SHORT', 'resultat%'].idxmax()
+    bestShortTrade = str(
+        round(dt.loc[dt['position'] == 'SHORT', 'resultat%'].max(), 2))
+    idWorstShort = dt.loc[dt['position'] == 'SHORT', 'resultat%'].idxmin()
+    worstShortTrade = str(
+        round(dt.loc[dt['position'] == 'SHORT', 'resultat%'].min(), 2))
+except:
+    AverageShortTrades = 0
+    TotalShortTrades = 0
+    bestShortTrade = ''
+    idBestShort = ''
+    idWorstShort = ''
+    worstShortTrade = ''
+    print("/!\ There is no SHORT Trades in your BackTest, maybe a problem...")
+
+try:
+    totalGoodLongTrade = dt.groupby(['position', 'tradeIs']).size()['LONG']['Good']
+except:
+    totalGoodLongTrade = 0
+    print("/!\ There is no good LONG Trades in your BackTest, maybe a problem...")
+
+try:
+    totalBadLongTrade = dt.groupby(['position', 'tradeIs']).size()['LONG']['Bad']
+except:
+    totalBadLongTrade = 0
+    print("/!\ There is no bad LONG Trades in your BackTest, maybe a problem...")
+
+try:
+    totalGoodShortTrade = dt.groupby(['position', 'tradeIs']).size()['SHORT']['Good']
+except:
+    totalGoodShortTrade = 0
+    print("/!\ There is no good SHORT Trades in your BackTest, maybe a problem...")
+
+try:
+    totalBadShortTrade = dt.groupby(['position', 'tradeIs']).size()['SHORT']['Bad']
+except:
+    totalBadShortTrade = 0
+    print("/!\ There is no bad SHORT Trades in your BackTest, maybe a problem...")
+
+TotalTrades = TotalGoodTrades + TotalBadTrades
+winRateRatio = (TotalGoodTrades/TotalTrades) * 100
+
+reasons = dt['reason'].unique()
+
+print("BackTest finished, final wallet :",wallet,"$")
+dt
+
+print("Pair Symbol :",symbol,)
+print("Period : [" + str(dfTest.index[0]) + "] -> [" +
+      str(dfTest.index[len(dfTest)-1]) + "]")
+print("Starting balance :", initialWallet, "$")
+
+print("\n----- General Informations -----")
+print("Final balance :", round(wallet, 2), "$")
+print("Performance vs US Dollar :", round(algoPercentage*100, 2), "%")
+print("Buy and Hold Performence :", round(holdPercentage*100, 2),
+      "% | with Leverage :", round(holdPercentage*100, 2)*leverage, "%")
+print("Performance vs Buy and Hold :", round(vsHoldPercentage, 2), "%")
+print("Best trade : +"+bestTrade, "%, the ", idbest)
+print("Worst trade :", worstTrade, "%, the ", idworst)
+print("Worst drawBack :", str(100*round(dt['drawBack'].min(), 2)), "%")
+print("Total fees : ", round(dt['frais'].sum(), 2), "$")
+
+print("\n----- Trades Informations -----")
+print("Total trades on period :",totalTrades)
+print("Number of positive trades :", TotalGoodTrades)
+print("Number of negative trades : ", TotalBadTrades)
+print("Trades win rate ratio :", round(winRateRatio, 2), '%')
+print("Average trades performance :",tradesPerformance,"%")
+print("Average positive trades :", AveragePercentagePositivTrades, "%")
+print("Average negative trades :", AveragePercentageNegativTrades, "%")
+
+print("\n----- LONG Trades Informations -----")
+print("Number of LONG trades :",TotalLongTrades)
+print("Average LONG trades performance :",AverageLongTrades, "%")
+print("Best  LONG trade +"+bestLongTrade, "%, the ", idBestLong)
+print("Worst LONG trade", worstLongTrade, "%, the ", idWorstLong)
+print("Number of positive LONG trades :",totalGoodLongTrade)
+print("Number of negative LONG trades :",totalBadLongTrade)
+print("LONG trade win rate ratio :", round(totalGoodLongTrade/TotalLongTrades*100, 2), '%')
+
+print("\n----- SHORT Trades Informations -----")
+print("Number of SHORT trades :",TotalShortTrades)
+print("Average SHORT trades performance :",AverageShortTrades, "%")
+print("Best  SHORT trade +"+bestShortTrade, "%, the ", idBestShort)
+print("Worst SHORT trade", worstShortTrade, "%, the ", idWorstShort)
+print("Number of positive SHORT trades :",totalGoodShortTrade)
+print("Number of negative SHORT trades :",totalBadShortTrade)
+print("SHORT trade win rate ratio :", round(totalGoodShortTrade/TotalShortTrades*100, 2), '%')
+
+print("\n----- Trades Reasons -----")
+reasons = dt['reason'].unique()
+for r in reasons:
+    print(r+" number :", dt.groupby('reason')['date'].nunique()[r])
+
+dt[['wallet', 'price']].plot(subplots=True, figsize=(20, 10))
+print("\n----- Plot -----")
